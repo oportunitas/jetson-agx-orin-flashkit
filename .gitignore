@@ -1,0 +1,5 @@
+work/
+*.tar.gz
+*.log
+.env
+config.local.env
