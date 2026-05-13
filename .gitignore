@@ -1,5 +1,7 @@
 work/
 *.tar.gz
+*.tbz2
 *.log
 .env
 config.local.env
+profiles.d/

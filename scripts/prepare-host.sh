@@ -11,11 +11,20 @@ fi
 echo "[1/4] Refreshing apt cache"
 sudo apt-get update
 
-echo "[2/4] Installing docker.io, usbutils, qemu-user-static, binfmt-support"
+# qemu-user-static was split into qemu-user-binfmt (+ -hwe variant) in Ubuntu
+# 26.04 / resolute. Pick whichever name resolves to a real package on the
+# host so apt doesn't bail with "no installation candidate".
+if apt-cache show qemu-user-binfmt 2>/dev/null | grep -q '^Package: '; then
+    QEMU_PKG=qemu-user-binfmt
+else
+    QEMU_PKG=qemu-user-static
+fi
+
+echo "[2/4] Installing docker.io, usbutils, $QEMU_PKG, binfmt-support"
 sudo apt-get install -y \
     docker.io \
     usbutils \
-    qemu-user-static \
+    "$QEMU_PKG" \
     binfmt-support
 
 echo "[3/4] Enabling docker service"

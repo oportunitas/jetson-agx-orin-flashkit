@@ -1,0 +1,334 @@
+#!/usr/bin/env bash
+# flashkit — flash a Jetson AGX Orin to any L4T-compatible OS image.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+# shellcheck source=lib/common.sh
+source "$REPO_ROOT/lib/common.sh"
+# shellcheck source=lib/ui.sh
+source "$REPO_ROOT/lib/ui.sh"
+# shellcheck source=lib/profile.sh
+source "$REPO_ROOT/lib/profile.sh"
+# shellcheck source=lib/recovery.sh
+source "$REPO_ROOT/lib/recovery.sh"
+# shellcheck source=lib/sdkm.sh
+source "$REPO_ROOT/lib/sdkm.sh"
+# shellcheck source=lib/methods/sdkmanager.sh
+source "$REPO_ROOT/lib/methods/sdkmanager.sh"
+# shellcheck source=lib/methods/manual.sh
+source "$REPO_ROOT/lib/methods/manual.sh"
+# shellcheck source=lib/methods/custom.sh
+source "$REPO_ROOT/lib/methods/custom.sh"
+
+usage() {
+    cat <<EOF
+${C_BOLD}flashkit${C_RESET} — Jetson AGX Orin flash app
+
+${C_BOLD}Usage:${C_RESET} flashkit <command> [args]
+
+${C_BOLD}Commands:${C_RESET}
+  ${C_CYAN}list${C_RESET}                       List available profiles
+  ${C_CYAN}info${C_RESET} <profile>              Show details about a profile
+  ${C_CYAN}flash${C_RESET} [profile] [opts]      Flash the Jetson (interactive picker if no profile)
+                              opts: --storage emmc|nvme
+  ${C_CYAN}setup${C_RESET} <profile>              Pre-fetch assets for a profile without flashing
+  ${C_CYAN}prepare${C_RESET}                    One-time host setup (Docker + qemu binfmt + USB tools)
+  ${C_CYAN}check${C_RESET}                      Verify Jetson is in recovery mode
+  ${C_CYAN}sdkm${C_RESET} <list|load|load-all>    Manage SDK Manager tarballs in sdkmanager/
+  ${C_CYAN}load-sdkm${C_RESET} <tarball>         (alias for 'sdkm load')
+  ${C_CYAN}clean${C_RESET} [--all|<profile>]     Remove cached artifacts
+  ${C_CYAN}help${C_RESET}                       This message
+
+${C_BOLD}Profiles:${C_RESET}
+  Built-in profiles live in profiles/  (version-controlled).
+  User additions live in profiles.d/    (gitignored).
+  See README.md for the profile format.
+
+EOF
+}
+
+cmd_list() {
+    echo "${C_BOLD}Available OS profiles:${C_RESET}"
+    echo
+    local rows
+    rows="$(list_profiles)"
+    if [[ -z "$rows" ]]; then
+        warn "No profiles found."
+        return 0
+    fi
+    while IFS=$'\t' read -r name desc; do
+        load_profile "$name"
+        profile_check
+        local badge; badge="$(profile_status_badge "$PROFILE_READY")"
+        printf "  [%b]  ${C_CYAN}%-22s${C_RESET}  %s\n" "$badge" "$name" "$desc"
+        printf "                  ${C_DIM}%s${C_RESET}\n" "$PROFILE_HINT"
+    done <<< "$rows"
+    echo
+    echo "${C_DIM}States: ${C_GREEN}ready${C_RESET}${C_DIM} = flash now | ${C_BLUE}auto-fetch${C_RESET}${C_DIM} = will download on flash | ${C_RED}blocked${C_RESET}${C_DIM} = needs your input${C_RESET}"
+    echo
+    echo "Run 'flashkit info <profile>' for details, or 'flashkit flash' to pick + flash."
+}
+
+cmd_info() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || fatal "Usage: flashkit info <profile>"
+    load_profile "$name"
+    cat <<EOF
+${C_BOLD}Profile:${C_RESET}        $PROFILE_NAME
+${C_BOLD}Description:${C_RESET}    $PROFILE_DESC
+${C_BOLD}Method:${C_RESET}         $PROFILE_METHOD
+${C_BOLD}Storage:${C_RESET}        default=$DEFAULT_STORAGE  supported=$SUPPORTED_STORAGE
+EOF
+    case "$PROFILE_METHOD" in
+        sdkmanager)
+            cat <<EOF
+${C_BOLD}JetPack version:${C_RESET} ${JETPACK_VERSION:-(unset)}
+${C_BOLD}SDKM filter:${C_RESET}    ${SDKM_IMAGE_FILTER:-(any)}
+${C_BOLD}SDKM target:${C_RESET}    ${SDKM_TARGET:-JETSON_AGX_ORIN_TARGETS}
+EOF
+            ;;
+        manual)
+            cat <<EOF
+${C_BOLD}BSP URL:${C_RESET}        ${L4T_BSP_URL:-(unset)}
+${C_BOLD}Rootfs URL:${C_RESET}     ${L4T_ROOTFS_URL:-(unset)}
+${C_BOLD}Flash target:${C_RESET}   ${L4T_FLASH_TARGET:-jetson-agx-orin-devkit}
+EOF
+            ;;
+        custom)
+            cat <<EOF
+${C_BOLD}BSP URL:${C_RESET}        ${L4T_BSP_URL:-(unset)}
+${C_BOLD}Flash target:${C_RESET}   ${L4T_FLASH_TARGET:-jetson-agx-orin-devkit}
+${C_BOLD}Note:${C_RESET}           Set CUSTOM_ROOTFS_PATH=/path/to/rootfs.tar.gz at flash time.
+EOF
+            ;;
+    esac
+}
+
+cmd_flash() {
+    local profile="" storage=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --storage) storage="$2"; shift 2 ;;
+            --storage=*) storage="${1#--storage=}"; shift ;;
+            -h|--help) usage; return 0 ;;
+            -*) fatal "Unknown flag: $1" ;;
+            *)
+                if [[ -z "$profile" ]]; then profile="$1"; shift
+                else fatal "Unexpected argument: $1"; fi
+                ;;
+        esac
+    done
+
+    # Interactive profile pick if not specified
+    if [[ -z "$profile" ]]; then
+        local -a names=() display=()
+        local rows
+        rows="$(list_profiles)"
+        [[ -n "$rows" ]] || fatal "No profiles found."
+        while IFS=$'\t' read -r n d; do
+            load_profile "$n"
+            profile_check
+            local badge; badge="$(profile_status_badge "$PROFILE_READY")"
+            names+=("$n")
+            display+=("$(printf "[%b]  %-22s %s" "$badge" "$n" "$d")")
+        done <<< "$rows"
+        pick_one "Pick an OS to flash:" "${display[@]}" \
+            || fatal "No profile selected."
+        profile="${names[$PICKED_INDEX]}"
+        echo
+    fi
+
+    load_profile "$profile"
+
+    storage="${storage:-$DEFAULT_STORAGE}"
+    if ! storage_supported "$SUPPORTED_STORAGE" "$storage"; then
+        fatal "Profile '$PROFILE_NAME' does not support storage='$storage' (supported: $SUPPORTED_STORAGE)"
+    fi
+
+    profile_check
+    cat <<EOF
+
+${C_BOLD}==> Pre-flight${C_RESET}
+    Profile  : $PROFILE_NAME
+    Method   : $PROFILE_METHOD
+    Storage  : $storage
+    Status   : $(profile_status_badge "$PROFILE_READY")
+    Note     : $PROFILE_HINT
+
+EOF
+    case "$PROFILE_READY" in
+        no)
+            err "Profile is blocked. Resolve the above and re-run."
+            exit 2
+            ;;
+        auto)
+            confirm "Proceed (will auto-fetch missing assets)?" \
+                || fatal "Aborted by user."
+            ;;
+        yes)
+            confirm "Proceed?" || fatal "Aborted by user."
+            ;;
+    esac
+
+    require_recovery || fatal "Aborting flash; Jetson is not in recovery mode."
+
+    local work_dir="${WORK_DIR:-$WORK_BASE/$PROFILE_NAME}"
+    mkdir -p "$work_dir"
+
+    case "$PROFILE_METHOD" in
+        sdkmanager) flash_sdkmanager "$work_dir" "$storage" ;;
+        manual)     flash_manual     "$work_dir" "$storage" ;;
+        custom)     flash_custom     "$work_dir" "$storage" ;;
+        *) fatal "Unknown method: $PROFILE_METHOD" ;;
+    esac
+}
+
+cmd_setup() {
+    local profile="${1:-}"
+    [[ -n "$profile" ]] || fatal "Usage: flashkit setup <profile>"
+    load_profile "$profile"
+    profile_check
+
+    cat <<EOF
+
+${C_BOLD}==> Setup${C_RESET}
+    Profile : $PROFILE_NAME
+    Method  : $PROFILE_METHOD
+    Status  : $(profile_status_badge "$PROFILE_READY")
+    Note    : $PROFILE_HINT
+
+EOF
+    case "$PROFILE_READY" in
+        yes) ok "Already ready to flash."; return 0 ;;
+        no)  err "Blocked: $PROFILE_HINT"; exit 2 ;;
+    esac
+
+    local work_dir="${WORK_DIR:-$WORK_BASE/$PROFILE_NAME}"
+    mkdir -p "$work_dir"
+
+    case "$PROFILE_METHOD" in
+        sdkmanager)
+            sdkm_ensure_for_filter "${SDKM_IMAGE_FILTER:-Ubuntu_}" \
+                || fatal "Failed to load SDK Manager image."
+            ok "SDK Manager image ready."
+            ;;
+        manual)
+            flash_manual "$work_dir" "${DEFAULT_STORAGE:-emmc}" setup-only
+            ok "BSP + rootfs prepared at $work_dir."
+            ;;
+        custom)
+            fatal "Custom-rootfs setup needs CUSTOM_ROOTFS_PATH at flash time; nothing to pre-fetch."
+            ;;
+    esac
+}
+
+cmd_sdkm() {
+    local action="${1:-list}"; shift || true
+    case "$action" in
+        list)     sdkm_cmd_list ;;
+        load)     sdkm_cmd_load "$@" ;;
+        load-all) sdkm_cmd_load_all ;;
+        *) fatal "Unknown sdkm action: $action (expected: list, load, load-all)" ;;
+    esac
+}
+
+sdkm_cmd_list() {
+    local rel
+    rel="$(realpath --relative-to=. "$SDKM_DIR" 2>/dev/null || echo "$SDKM_DIR")"
+    echo "${C_BOLD}Tarballs in $rel/:${C_RESET}"
+    local tb count=0
+    while IFS= read -r tb; do
+        [[ -z "$tb" ]] && continue
+        local name size flavor status
+        name="$(basename "$tb")"
+        size="$(du -h "$tb" 2>/dev/null | cut -f1)"
+        flavor="$(sdkm_classify_filename "$name")"
+        case "$flavor" in
+            JP5) variant="Ubuntu_20.04" ;;
+            JP6) variant="Ubuntu_22.04" ;;
+            JP7) variant="Ubuntu_24.04" ;;
+            *)   variant="" ;;
+        esac
+        if [[ -n "$variant" ]] && sdkm_list_loaded | grep -q -- "$variant"; then
+            status="${C_GREEN}loaded${C_RESET}    "
+        else
+            status="${C_DIM}not loaded${C_RESET}"
+        fi
+        printf "  [%s]  [%b]  %5s  %s\n" "${flavor:-?}" "$status" "$size" "$name"
+        count=$((count+1))
+    done < <(sdkm_list_tarballs)
+    [[ $count -eq 0 ]] && echo "  ${C_DIM}(none — drop NVIDIA SDK Manager tarballs into $rel/)${C_RESET}"
+    echo
+    echo "${C_BOLD}Loaded SDK Manager Docker images:${C_RESET}"
+    local loaded
+    loaded="$(sdkm_list_loaded)"
+    if [[ -z "$loaded" ]]; then
+        echo "  ${C_DIM}(none)${C_RESET}"
+    else
+        printf "%s\n" "$loaded" | while IFS= read -r img; do
+            echo "  $img"
+        done
+    fi
+}
+
+sdkm_cmd_load() {
+    local arg="${1:-}"
+    [[ -n "$arg" ]] || fatal "Usage: flashkit sdkm load <path|filename|pattern>"
+    local path
+    if [[ -f "$arg" ]]; then
+        path="$arg"
+    elif [[ -f "$SDKM_DIR/$arg" ]]; then
+        path="$SDKM_DIR/$arg"
+    else
+        path="$(sdkm_find_tarball "$arg" 2>/dev/null || true)"
+        [[ -n "$path" && -f "$path" ]] || fatal "No tarball matching '$arg' in $SDKM_DIR/"
+    fi
+    sdkm_load_tarball "$path"
+}
+
+sdkm_cmd_load_all() {
+    local count=0 tb
+    while IFS= read -r tb; do
+        [[ -z "$tb" ]] && continue
+        sdkm_load_tarball "$tb"
+        count=$((count+1))
+    done < <(sdkm_list_tarballs)
+    [[ $count -eq 0 ]] && warn "No tarballs in $SDKM_DIR"
+}
+
+cmd_clean() {
+    local arg="${1:---all}"
+    case "$arg" in
+        --all)
+            info "Removing $WORK_BASE"
+            rm -rf "$WORK_BASE" 2>/dev/null || sudo rm -rf "$WORK_BASE"
+            ;;
+        *)
+            local target="$WORK_BASE/$arg"
+            [[ -d "$target" ]] || fatal "No work dir for profile: $arg"
+            info "Removing $target"
+            rm -rf "$target" 2>/dev/null || sudo rm -rf "$target"
+            ;;
+    esac
+}
+
+# Dispatch
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+    "" | help | -h | --help)
+        usage ;;
+    list)            cmd_list "$@" ;;
+    info)            cmd_info "$@" ;;
+    flash)           cmd_flash "$@" ;;
+    setup)           cmd_setup "$@" ;;
+    prepare)         exec "$REPO_ROOT/scripts/prepare-host.sh" "$@" ;;
+    check)           exec "$REPO_ROOT/scripts/check-recovery.sh" "$@" ;;
+    sdkm)            cmd_sdkm "$@" ;;
+    load-sdkm|load-sdkmanager)
+                     cmd_sdkm load "$@" ;;
+    clean)           cmd_clean "$@" ;;
+    *)               fatal "Unknown command: $cmd. Run 'flashkit help' for usage." ;;
+esac

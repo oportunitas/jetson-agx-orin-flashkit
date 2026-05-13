@@ -1,0 +1,28 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        sudo \
+        wget \
+        tar \
+        bzip2 \
+        lbzip2 \
+        xz-utils \
+        python3 \
+        python3-yaml \
+        usbutils \
+        libxml2-utils \
+        cpio \
+        binutils \
+        xxd \
+        libfuse2 \
+        abootimg \
+        sshpass \
+        openssl \
+        qemu-user-static \
+        coreutils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work
